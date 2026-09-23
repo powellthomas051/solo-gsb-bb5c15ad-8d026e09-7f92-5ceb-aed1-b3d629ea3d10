@@ -103,6 +103,75 @@ class RenewResponse(BaseModel):
     )
 
 
+class RenewBatchItem(BaseModel):
+    """批量续租中的单个任务凭据，顺序即响应顺序。"""
+
+    task_key: str = Field(min_length=1, max_length=512)
+    token: str = Field(min_length=1, description="申请时返回的所有权令牌")
+    fencing_token: int = Field(ge=0, description="申请时返回的防栅序号")
+
+
+class RenewBatchRequest(BaseModel):
+    items: list[RenewBatchItem] = Field(
+        min_length=BATCH_MIN_SIZE,
+        max_length=BATCH_MAX_SIZE,
+        description=(
+            f"一批待续租任务，{BATCH_MIN_SIZE}～{BATCH_MAX_SIZE} 个，"
+            "task_key 不允许重复；各自携带 token 与 fencing_token"
+        ),
+        examples=[
+            [
+                {"task_key": "video-transcode:order-123",
+                 "token": "9f3c...", "fencing_token": 1},
+                {"task_key": "video-transcode:order-456",
+                 "token": "a1b2...", "fencing_token": 1},
+            ]
+        ],
+    )
+    ttl_ms: int | None = Field(
+        default=None, gt=0, description="全批统一的新 TTL（毫秒），缺省使用服务端默认值"
+    )
+
+    @field_validator("items")
+    @classmethod
+    def reject_duplicate_task_keys(cls, v: list[RenewBatchItem]) -> list[RenewBatchItem]:
+        keys = [item.task_key for item in v]
+        if len(set(keys)) != len(keys):
+            raise ValueError("task_key in items must be unique")
+        return v
+
+
+class RenewBatchLease(BaseModel):
+    """批量续租成功时的单项结果，顺序与请求的 items 一致。"""
+
+    task_key: str
+    expires_at_ms: int = Field(
+        description="新的过期时间（Redis 服务器时钟，Unix 毫秒），整批同一基准"
+    )
+
+
+class RenewBatchFailure(BaseModel):
+    """批量续租失败时的单项失败原因，顺序与请求的 items 一致。"""
+
+    index: int = Field(description="失败项在请求 items 中的下标（从 0 开始）")
+    task_key: str
+    reason: str = Field(
+        description="失败原因：not_found（租约不存在）/ conflict（令牌或防栅序号不匹配）/ expired（租约已过期）"
+    )
+
+
+class RenewBatchResponse(BaseModel):
+    renewed: bool
+    leases: list[RenewBatchLease] = Field(
+        default_factory=list,
+        description="全部成功时按输入顺序给出每项新的 expires_at_ms",
+    )
+    failures: list[RenewBatchFailure] = Field(
+        default_factory=list,
+        description="整批失败时逐项失败原因（仅失败项，按输入顺序）",
+    )
+
+
 class ReleaseRequest(BaseModel):
     task_key: str = Field(min_length=1, max_length=512)
     token: str = Field(min_length=1)
@@ -138,12 +207,12 @@ class LeaseEvent(BaseModel):
 
     id: str = Field(description="Redis Stream 条目 ID（<毫秒时间>-<序号>），即分页游标")
     op: str = Field(
-        description="操作类型：acquire / acquire_batch / renew / release"
+        description="操作类型：acquire / acquire_batch / renew / renew_batch / release"
     )
     result: str = Field(
         description=(
             "操作结果：acquire(_batch) 为 acquired / conflict；"
-            "renew 为 renewed / not_found / conflict / expired；"
+            "renew(_batch) 为 renewed / not_found / conflict / expired；"
             "release 为 released / ignored"
         )
     )
@@ -152,7 +221,7 @@ class LeaseEvent(BaseModel):
     )
     time_ms: int = Field(description="事件落账时刻（Redis 服务器时钟，Unix 毫秒）")
     batch_size: int | None = Field(
-        default=None, description="仅批量申请事件携带：该批次的任务键数量"
+        default=None, description="仅批量申请 / 批量续租事件携带：该批次的任务数量"
     )
 
 

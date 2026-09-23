@@ -6,7 +6,9 @@
 
 覆盖场景：获取 / 冲突 / 校验 / 续租 / 释放 / 防栅序号单调递增 /
 旧持有者在超时后无法影响新租约，以及批量申请的全成全败、
-冲突时不写不递增、过期接管与凭据兼容；以及租约审计流：
+冲突时不写不递增、过期接管与凭据兼容，以及批量续租的全成全败、
+逐项失败原因、失败时不改变任何 TTL、审计逐任务落账；
+以及租约审计流：
 四类操作（含被拒 / 忽略）按任务键落账、事件字段正确、
 cursor 分页不重不漏、非法 cursor/limit 拒绝、批量冲突仅冲突方落账、
 按保留条数裁剪最旧事件；以及滑动窗口成本限流的
@@ -153,6 +155,7 @@ def main():
           f"{code} {st}")
 
     batch_checks()
+    renew_batch_checks()
     audit_checks()
     limit_checks()
 
@@ -257,6 +260,140 @@ def batch_checks():
                    {"task_key": k1, "token": taken[k1]["token"],
                     "fencing_token": taken[k1]["fencing_token"]})
     check("batch new lease valid", code == 200 and v["valid"], f"{code} {v}")
+
+
+def renew_batch_checks():
+    """renew-batch：参数校验 / 全成 / 全败逐项原因 / 失败不动任何 TTL / 审计落账 / 过期。"""
+    base = f"smoke-renew-batch:{int(time.time() * 1000)}"
+    path = "/v1/leases/renew-batch"
+    k1, k2, k3, k4, k5 = [f"{base}:{i}" for i in range(5)]
+
+    def item(key, token, fence):
+        return {"task_key": key, "token": token, "fencing_token": fence}
+
+    # 参数校验：少于 2 项 / 多于 32 项 / task_key 重复 -> 422
+    code, _ = call("POST", path, {"items": [item(k1, "t", 1)]})
+    check("renew-batch size < 2 -> 422", code == 422, f"code={code}")
+    code, _ = call("POST", path, {
+        "items": [item(f"{base}:x{i}", "t", 1) for i in range(33)]})
+    check("renew-batch size > 32 -> 422", code == 422, f"code={code}")
+    code, _ = call("POST", path, {"items": [item(k1, "t", 1), item(k1, "t", 1)]})
+    check("renew-batch duplicate keys -> 422", code == 422, f"code={code}")
+    # ttl_ms 越界 -> 400（与单项续租一致，由服务端 resolve_ttl 判定）
+    code, _ = call("POST", path, {"items": [item(k1, "t", 1), item(k2, "t", 1)],
+                                  "ttl_ms": 999_999})
+    check("renew-batch ttl out of range -> 400", code == 400, f"code={code}")
+
+    # 准备 3 个有效租约（k1/k2/k3），k4 从不申请，k5 短 TTL 稍后过期
+    creds = {}
+    for k in (k1, k2, k3):
+        code, a = call("POST", "/v1/leases/acquire", {"task_key": k, "ttl_ms": 5000})
+        check("renew-batch setup acquire", code == 200 and a["acquired"], f"{code} {a}")
+        creds[k] = (a["token"], a["fencing_token"])
+    code, a5 = call("POST", "/v1/leases/acquire", {"task_key": k5, "ttl_ms": 300})
+    check("renew-batch setup short lease", code == 200 and a5["acquired"], f"{code} {a5}")
+    creds[k5] = (a5["token"], a5["fencing_token"])
+
+    # 全成：200、顺序与输入一致、同一 expires 基准、租约确实被续到新时刻
+    req_items = [item(k3, *creds[k3]), item(k1, *creds[k1]), item(k2, *creds[k2])]
+    code, b = call("POST", path, {"items": req_items, "ttl_ms": 8000})
+    check("renew-batch ok", code == 200 and b["renewed"], f"{code} {b}")
+    leases = b.get("leases", [])
+    check("renew-batch order/count",
+          [l["task_key"] for l in leases] == [k3, k1, k2], f"{leases}")
+    check("renew-batch same expires baseline",
+          len({l["expires_at_ms"] for l in leases}) == 1, f"{leases}")
+    new_expires = leases[0]["expires_at_ms"]
+    code, st1 = call("GET", f"/v1/leases/{k1}")
+    check("renew-batch persisted",
+          code == 200 and st1["expires_at_ms"] == new_expires, f"{code} {st1}")
+    # 凭据不变，单项 validate 仍然有效
+    code, v = call("POST", "/v1/leases/validate",
+                   {"task_key": k1, "token": creds[k1][0],
+                    "fencing_token": creds[k1][1]})
+    check("renew-batch credential still valid", code == 200 and v["valid"],
+          f"{code} {v}")
+
+    # 全败：k1 凭据错误(conflict)、k4 不存在(not_found)、k5 过期(expired/not_found)
+    time.sleep(0.7)
+    bad_items = [
+        item(k1, "wrong-token", creds[k1][1]),
+        item(k4, "ghost", 1),
+        item(k5, *creds[k5]),
+    ]
+    code, f = call("POST", path, {"items": bad_items, "ttl_ms": 8000})
+    check("renew-batch partial invalid -> 409",
+          code == 409 and not f["renewed"], f"{code} {f}")
+    failures = f.get("failures", [])
+    check("renew-batch failure order/count",
+          [x["index"] for x in failures] == [0, 1, 2]
+          and [x["task_key"] for x in failures] == [k1, k4, k5],
+          f"{failures}")
+    by_key = {x["task_key"]: x["reason"] for x in failures}
+    check("renew-batch reasons conflict/not_found",
+          by_key[k1] == "conflict" and by_key[k4] == "not_found", f"{failures}")
+    check("renew-batch expired reason",
+          by_key[k5] in ("expired", "not_found"), f"{failures}")
+    check("renew-batch no leases on failure", f.get("leases", []) == [], f"{f}")
+
+    # 全败时不改变任何 TTL：k1（成功项）的 expires_at 必须仍是上一次成功续租的值
+    code, st1 = call("GET", f"/v1/leases/{k1}")
+    check("renew-batch failure changes no ttl",
+          code == 200 and st1["expires_at_ms"] == new_expires, f"{code} {st1}")
+
+    # 审计（此时只发生过一次成功批与一次失败批）：
+    # 成功批次每项各落一条 renewed（batch_size=3）；失败批次仅失败项再各落一条
+    # 原因事件，成功项 k2/k3 在失败批次中不落任何事件（k1 是失败项，应有两条）
+    for k in (k1, k2, k3):
+        code, page = fetch_events(k)
+        renewed = [e for e in page["events"]
+                   if e["op"] == "renew_batch" and e["result"] == "renewed"]
+        check(f"renew-batch audit single renewed {k}",
+              len(renewed) == 1 and renewed[0]["batch_size"] == 3
+              and renewed[0]["fencing_token"] == creds[k][1], f"{page}")
+    code, page = fetch_events(k1)
+    check("renew-batch audit conflict event appended",
+          [e["result"] for e in page["events"]
+           if e["op"] == "renew_batch" and e["batch_size"] == 3]
+          == ["renewed", "conflict"], f"{page}")
+    check("renew-batch audit conflict fencing",
+          next(e for e in page["events"] if e["result"] == "conflict")
+          ["fencing_token"] == creds[k1][1], f"{page}")
+    code, page2k = fetch_events(k2)
+    check("renew-batch valid item no failure event",
+          [e["result"] for e in page2k["events"] if e["op"] == "renew_batch"]
+          == ["renewed"], f"{page2k}")
+    code, page4 = fetch_events(k4)
+    ev4 = [e for e in page4["events"] if e["op"] == "renew_batch"]
+    check("renew-batch audit not_found event on new key",
+          len(ev4) == 1 and ev4[0]["result"] == "not_found"
+          and ev4[0]["fencing_token"] is None and ev4[0]["batch_size"] == 3,
+          f"{page4}")
+
+    # 失败批次后，用正确凭据重新整批续租仍可成功（k2 再落一条 size=2 的 renewed）
+    code, b2 = call("POST", path,
+                    {"items": [item(k1, *creds[k1]), item(k2, *creds[k2])],
+                     "ttl_ms": 5000})
+    check("renew-batch retry ok", code == 200 and b2["renewed"], f"{code} {b2}")
+    code, page2 = fetch_events(k2)
+    rb2 = [(e["result"], e["batch_size"])
+           for e in page2["events"] if e["op"] == "renew_batch"]
+    check("renew-batch success item untouched on failure batch",
+          rb2 == [("renewed", 3), ("renewed", 2)], f"{page2}")
+
+    # 防栅序号错误同样判为 conflict，且整批失败（k2 不续租）
+    token1, fence1 = creds[k1]
+    expires_k2_before = b2["leases"][1]["expires_at_ms"]
+    code, f = call("POST", path,
+                   {"items": [item(k1, token1, fence1 + 5), item(k2, *creds[k2])],
+                    "ttl_ms": 5000})
+    check("renew-batch wrong fencing -> 409 conflict",
+          code == 409 and len(f.get("failures", [])) == 1
+          and f["failures"][0]["task_key"] == k1
+          and f["failures"][0]["reason"] == "conflict", f"{code} {f}")
+    code, st2 = call("GET", f"/v1/leases/{k2}")
+    check("renew-batch wrong fencing touches no ttl",
+          code == 200 and st2["expires_at_ms"] == expires_k2_before, f"{code} {st2}")
 
 
 def fetch_events(key, cursor=None, limit=None):

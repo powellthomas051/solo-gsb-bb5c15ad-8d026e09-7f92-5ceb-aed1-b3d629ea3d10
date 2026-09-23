@@ -11,12 +11,12 @@
 
 租约审计约定：
 - 每个任务键对应一个 Redis Stream（事件流键），申请（成功 / 被拒）、
-  续租、释放以及批量申请的逐任务结果都在状态转换的同一脚本内 XADD 落账，
-  与状态转换原子提交，不可能出现"操作成功但事件丢失"。
-- 条目字段：op（acquire / acquire_batch / renew / release）、
+  续租（单个 / 批量）、释放以及批量申请的逐任务结果都在状态转换的同一脚本内
+  XADD 落账，与状态转换原子提交，不可能出现"操作成功但事件丢失"。
+- 条目字段：op（acquire / acquire_batch / renew / renew_batch / release）、
   result（操作结果）、fencing（相关防栅序号，无则空串）、
   time_ms（Redis 服务器毫秒，与状态判定同一时钟）、
-  batch_size（仅批量申请携带）。
+  batch_size（仅批量申请 / 批量续租携带）。
 - retention > 0 时以 XADD MAXLEN 精确裁剪，每个流只保留最新的 retention 条，
   超出部分从最旧事件开始丢弃；retention = 0 表示不限制。
 
@@ -185,6 +185,76 @@ audit_add(KEYS[2], retention,
   {'op', 'renew', 'result', 'renewed',
    'fencing', ARGV[2], 'time_ms', tostring(now)})
 return {1, 'ok', new_expires}
+"""
+
+# 批量续租（2～32 个任务，统一 TTL），全成全败：
+# 先用同一次 TIME 取到的服务器时间对全部任务逐项预检，
+# 任一租约不存在（not_found）、令牌或防栅序号不匹配（conflict）、
+# 已过期（expired）即整体失败：只给每个失败任务各落一条审计事件，
+# 不 HSET 任何 expires_at、不 PEXPIRE 任何租约键，成功项也不落账
+# （与批量申请全败时的落账口径一致：无状态变化即不写事件）；
+# 全部有效时再统一写入，所有新 expires_at 基于同一基准时刻。
+# 判定顺序与单项续租一致：存在性 -> 凭据 -> 过期。
+# KEYS[1..n]      = 租约键
+# KEYS[n+1..2n]   = 审计事件流键（与租约键同序）
+# ARGV[1]         = 任务数 n
+# ARGV[2..n+1]    = 各任务的令牌（与输入同序）
+# ARGV[n+2..2n+1] = 各任务的防栅序号（与输入同序）
+# ARGV[2n+2]      = ttl_ms（全批统一）
+# ARGV[2n+3]      = 事件保留条数
+# 成功返回 {1, expires_1, ..., expires_n}
+# 失败返回 {0, {下标, 原因}, ...}（下标为 1 基，按输入顺序，每项一个嵌套数组）
+RENEW_BATCH_LUA = _AUDIT_LUA + """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local n = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2 * n + 2])
+local retention = ARGV[2 * n + 3]
+
+local failures = {}
+local reasons = {}
+for i = 1, n do
+  local token = redis.call('HGET', KEYS[i], 'token')
+  if not token then
+    reasons[i] = 'not_found'
+    failures[#failures + 1] = i
+  elseif token ~= ARGV[i + 1]
+      or redis.call('HGET', KEYS[i], 'fencing') ~= ARGV[n + 1 + i] then
+    reasons[i] = 'conflict'
+    failures[#failures + 1] = i
+  elseif tonumber(redis.call('HGET', KEYS[i], 'expires_at')) <= now then
+    reasons[i] = 'expired'
+    failures[#failures + 1] = i
+  end
+end
+
+if #failures > 0 then
+  for _, i in ipairs(failures) do
+    local f = tonumber(redis.call('HGET', KEYS[i], 'fencing'))
+    audit_add(KEYS[n + i], retention,
+      {'op', 'renew_batch', 'result', reasons[i],
+       'fencing', f and tostring(f) or '', 'time_ms', tostring(now),
+       'batch_size', tostring(n)})
+  end
+  local reply = {0}
+  for _, i in ipairs(failures) do
+    reply[#reply + 1] = {i, reasons[i]}
+  end
+  return reply
+end
+
+local new_expires = now + ttl
+local reply = {1}
+for i = 1, n do
+  redis.call('HSET', KEYS[i], 'expires_at', new_expires)
+  redis.call('PEXPIRE', KEYS[i], ttl)
+  audit_add(KEYS[n + i], retention,
+    {'op', 'renew_batch', 'result', 'renewed',
+     'fencing', ARGV[n + 1 + i], 'time_ms', tostring(now),
+     'batch_size', tostring(n)})
+  reply[#reply + 1] = new_expires
+end
+return reply
 """
 
 # 释放租约：令牌与防栅序号同时匹配才删除，否则静默忽略。
