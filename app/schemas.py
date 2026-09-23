@@ -103,6 +103,65 @@ class RenewResponse(BaseModel):
     )
 
 
+class RenewLeaseItem(BaseModel):
+    """批量续租中的单个任务凭据。"""
+
+    task_key: str = Field(
+        min_length=1, max_length=512, examples=["video-transcode:order-123"]
+    )
+    token: str = Field(min_length=1, description="申请时获得的所有权令牌")
+    fencing_token: int = Field(ge=0, description="申请时获得的防栅序号")
+
+
+class RenewBatchRequest(BaseModel):
+    items: list[RenewLeaseItem] = Field(
+        min_length=BATCH_MIN_SIZE,
+        max_length=BATCH_MAX_SIZE,
+        description=(
+            f"一批待续租租约，{BATCH_MIN_SIZE}～{BATCH_MAX_SIZE} 个且 "
+            "task_key 不允许重复"
+        ),
+    )
+    ttl_ms: int | None = Field(
+        default=None, gt=0, description="统一的新 TTL（毫秒），缺省使用服务端默认值"
+    )
+
+    @field_validator("items")
+    @classmethod
+    def reject_duplicates(cls, v: list[RenewLeaseItem]) -> list[RenewLeaseItem]:
+        keys = [item.task_key for item in v]
+        if len(set(keys)) != len(keys):
+            raise ValueError("task_key in items must be unique")
+        return v
+
+
+class RenewLeaseResult(BaseModel):
+    """批量续租中单个任务的结果，顺序与请求的 items 一致。"""
+
+    task_key: str
+    renewed: bool
+    expires_at_ms: int | None = Field(
+        default=None,
+        description="续租成功后的新过期时间（Redis 服务器时钟，Unix 毫秒），整批同一基准",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="失败原因：not_found / conflict / expired；成功时为 null",
+    )
+
+
+class RenewBatchResponse(BaseModel):
+    renewed: bool
+    results: list[RenewLeaseResult] = Field(
+        default_factory=list,
+        description=(
+            "按输入顺序返回的逐项结果：全部成功时每项含新 expires_at_ms；"
+            "整批失败时仅包含预检失败的任务（各带 reason），"
+            "预检通过的任务无任何状态变化"
+        ),
+    )
+
+
 class ReleaseRequest(BaseModel):
     task_key: str = Field(min_length=1, max_length=512)
     token: str = Field(min_length=1)
@@ -138,12 +197,14 @@ class LeaseEvent(BaseModel):
 
     id: str = Field(description="Redis Stream 条目 ID（<毫秒时间>-<序号>），即分页游标")
     op: str = Field(
-        description="操作类型：acquire / acquire_batch / renew / release"
+        description=(
+            "操作类型：acquire / acquire_batch / renew / renew_batch / release"
+        )
     )
     result: str = Field(
         description=(
             "操作结果：acquire(_batch) 为 acquired / conflict；"
-            "renew 为 renewed / not_found / conflict / expired；"
+            "renew(_batch) 为 renewed / not_found / conflict / expired；"
             "release 为 released / ignored"
         )
     )
@@ -152,7 +213,8 @@ class LeaseEvent(BaseModel):
     )
     time_ms: int = Field(description="事件落账时刻（Redis 服务器时钟，Unix 毫秒）")
     batch_size: int | None = Field(
-        default=None, description="仅批量申请事件携带：该批次的任务键数量"
+        default=None,
+        description="仅批量申请 / 批量续租事件携带：该批次的任务键数量",
     )
 
 

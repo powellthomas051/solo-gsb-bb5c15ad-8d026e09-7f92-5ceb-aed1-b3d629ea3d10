@@ -6,8 +6,10 @@
 
 覆盖场景：获取 / 冲突 / 校验 / 续租 / 释放 / 防栅序号单调递增 /
 旧持有者在超时后无法影响新租约，以及批量申请的全成全败、
-冲突时不写不递增、过期接管与凭据兼容；以及租约审计流：
-四类操作（含被拒 / 忽略）按任务键落账、事件字段正确、
+冲突时不写不递增、过期接管与凭据兼容；以及批量续租的参数校验、
+全成（顺序 / 同一时间基准 / 新 TTL）、全败逐项原因、失败批次
+不改任何 TTL（含预检通过项）、逐任务审计落账；以及租约审计流：
+各操作（含被拒 / 忽略）按任务键落账、事件字段正确、
 cursor 分页不重不漏、非法 cursor/limit 拒绝、批量冲突仅冲突方落账、
 按保留条数裁剪最旧事件；以及滑动窗口成本限流的
 剩余额度 / 成本累计 / 超限 429 / 窗口滑动恢复 / 并发不超额 /
@@ -153,6 +155,7 @@ def main():
           f"{code} {st}")
 
     batch_checks()
+    renew_batch_checks()
     audit_checks()
     limit_checks()
 
@@ -259,6 +262,147 @@ def batch_checks():
     check("batch new lease valid", code == 200 and v["valid"], f"{code} {v}")
 
 
+def renew_batch_checks():
+    """renew-batch：参数校验 / 全成 / 全败逐项原因 / 不改任何 TTL / 逐任务审计。"""
+    base = f"smoke-renew-batch:{int(time.time() * 1000)}"
+    k1, k2, k3, k4 = [f"{base}:{i}" for i in range(4)]
+
+    def cred(k, lease):
+        return {"task_key": k, "token": lease["token"],
+                "fencing_token": lease["fencing_token"]}
+
+    leases = {}
+    for k in (k1, k2, k3):
+        code, a = call("POST", "/v1/leases/acquire",
+                       {"task_key": k, "ttl_ms": 10_000})
+        check(f"renew-batch setup acquire {k}", code == 200 and a["acquired"],
+              f"{code} {a}")
+        leases[k] = a
+
+    # 参数校验：少于 2 个 / 多于 32 个 / 重复 task_key -> 422
+    code, _ = call("POST", "/v1/leases/renew-batch",
+                   {"items": [cred(k1, leases[k1])]})
+    check("renew-batch size < 2 -> 422", code == 422, f"code={code}")
+    many = [{"task_key": f"{base}:m{i}", "token": "t", "fencing_token": 1}
+            for i in range(33)]
+    code, _ = call("POST", "/v1/leases/renew-batch", {"items": many})
+    check("renew-batch size > 32 -> 422", code == 422, f"code={code}")
+    code, _ = call("POST", "/v1/leases/renew-batch",
+                   {"items": [cred(k1, leases[k1]), cred(k1, leases[k1])]})
+    check("renew-batch duplicate keys -> 422", code == 422, f"code={code}")
+    bad_token = dict(cred(k1, leases[k1])); bad_token["token"] = ""
+    code, _ = call("POST", "/v1/leases/renew-batch",
+                   {"items": [bad_token, cred(k2, leases[k2])]})
+    check("renew-batch empty token -> 422", code == 422, f"code={code}")
+    bad_fence = dict(cred(k1, leases[k1])); bad_fence["fencing_token"] = -1
+    code, _ = call("POST", "/v1/leases/renew-batch",
+                   {"items": [bad_fence, cred(k2, leases[k2])]})
+    check("renew-batch negative fencing -> 422", code == 422, f"code={code}")
+
+    # 全成：顺序与输入一致、全部 renewed、expires_at_ms 同一基准且 ≈ now+ttl
+    code, before = call("GET", f"/v1/leases/{k1}")
+    before_exp = {k: None for k in (k1, k2, k3)}
+    for k in (k1, k2, k3):
+        _, st = call("GET", f"/v1/leases/{k}")
+        before_exp[k] = st["expires_at_ms"]
+    code, okb = call("POST", "/v1/leases/renew-batch",
+                     {"items": [cred(k1, leases[k1]), cred(k2, leases[k2]),
+                                cred(k3, leases[k3])],
+                      "ttl_ms": 20_000})
+    check("renew-batch success", code == 200 and okb["renewed"], f"{code} {okb}")
+    results = okb.get("results", [])
+    check("renew-batch result order",
+          [r["task_key"] for r in results] == [k1, k2, k3], f"{results}")
+    check("renew-batch all renewed w/o reason",
+          all(r["renewed"] and r["reason"] is None and r["expires_at_ms"]
+              for r in results), f"{results}")
+    new_exp = {r["task_key"]: r["expires_at_ms"] for r in results}
+    check("renew-batch same time baseline",
+          len(set(new_exp.values())) == 1, f"{results}")
+    check("renew-batch ttl applied",
+          all(new_exp[k] > before_exp[k] for k in (k1, k2, k3)),
+          f"{new_exp} vs {before_exp}")
+    now_ms = int(time.time() * 1000)
+    check("renew-batch expires ≈ now+20s",
+          abs(next(iter(new_exp.values())) - (now_ms + 20_000)) < 2_000,
+          f"{new_exp}")
+    # 新过期时刻经状态接口可见（Hash 已更新 + PEXPIRE 已刷新）
+    code, st = call("GET", f"/v1/leases/{k1}")
+    check("renew-batch state visible",
+          code == 200 and st["held"] and st["expires_at_ms"] == new_exp[k1]
+          and st["remaining_ms"] > 15_000, f"{st}")
+
+    # 成功批次逐任务审计：renew_batch/renewed，带当前 fencing 与 batch_size=3
+    for k in (k1, k2, k3):
+        code, page = call("GET", f"/v1/leases/{k}/events")
+        e = page["events"][-1]
+        check(f"renew-batch audit {k}",
+              e["op"] == "renew_batch" and e["result"] == "renewed"
+              and e["fencing_token"] == leases[k]["fencing_token"]
+              and e["batch_size"] == 3, f"{e}")
+
+    # 全败逐项原因：k1 释放 -> not_found；k2 错误 token -> conflict；
+    # k4 错误防栅序号 -> conflict；k3 凭据正确（预检通过，不得出现在失败列表）
+    code, rel = call("POST", "/v1/leases/release",
+                     {"task_key": k1, "token": leases[k1]["token"],
+                      "fencing_token": leases[k1]["fencing_token"]})
+    check("renew-batch setup release k1", code == 200 and rel["released"],
+          f"{code} {rel}")
+    bad_t = cred(k2, leases[k2]); bad_t["token"] = "wrong-token"
+    # k4 从未申请 -> 租约不存在，not_found 优先于凭据判定
+    bad_f = cred(k4, leases[k3])
+    items = [cred(k1, leases[k1]), bad_t, cred(k3, leases[k3]), bad_f]
+    code, st3_before = call("GET", f"/v1/leases/{k3}")
+    code, fb = call("POST", "/v1/leases/renew-batch",
+                    {"items": items, "ttl_ms": 20_000})
+    check("renew-batch failure -> 409", code == 409 and not fb["renewed"],
+          f"{code} {fb}")
+    reasons = {r["task_key"]: r["reason"] for r in fb.get("results", [])}
+    check("renew-batch per-item reasons",
+          reasons == {k1: "not_found", k2: "conflict", k4: "not_found"},
+          f"{reasons}")
+    check("renew-batch failed results carry no expiry",
+          all(r["renewed"] is False and r["expires_at_ms"] is None
+              for r in fb.get("results", [])), f"{fb}")
+    # 预检通过的 k3 不在失败列表中，且 TTL 完全未变
+    check("renew-batch passing item omitted", k3 not in reasons, f"{reasons}")
+    code, st3_after = call("GET", f"/v1/leases/{k3}")
+    check("renew-batch passing item untouched",
+          st3_after["expires_at_ms"] == new_exp[k3]
+          and st3_after["remaining_ms"] <= st3_before["remaining_ms"],
+          f"{st3_before} vs {st3_after}")
+
+    # 失败批次逐任务审计：仅失败任务各落一条对应原因，k3 不新增事件
+    code, page = call("GET", f"/v1/leases/{k1}/events")
+    check("renew-batch audit not_found",
+          page["events"][-1]["result"] == "not_found"
+          and page["events"][-1]["op"] == "renew_batch"
+          and page["events"][-1]["fencing_token"] is None
+          and page["events"][-1]["batch_size"] == 4, f"{page['events'][-1]}")
+    code, page = call("GET", f"/v1/leases/{k2}/events")
+    check("renew-batch audit conflict",
+          page["events"][-1]["result"] == "conflict"
+          and page["events"][-1]["fencing_token"] == leases[k2]["fencing_token"]
+          and page["events"][-1]["batch_size"] == 4, f"{page['events'][-1]}")
+    code, page = call("GET", f"/v1/leases/{k3}/events")
+    check("renew-batch passing item no new audit",
+          page["events"][-1]["result"] == "renewed"
+          and page["events"][-1]["batch_size"] == 3, f"{page['events'][-1]}")
+
+    # k2 在失败批次后仍可用原凭据正常批量续租（失败未破坏其租约）
+    code, again = call("POST", "/v1/leases/renew-batch",
+                       {"items": [cred(k2, leases[k2]), cred(k3, leases[k3])],
+                        "ttl_ms": 5_000})
+    check("renew-batch after failure works for survivors",
+          code == 200 and again["renewed"]
+          and [r["task_key"] for r in again["results"]] == [k2, k3],
+          f"{code} {again}")
+    # 短 TTL 同样精确生效
+    code, st = call("GET", f"/v1/leases/{k2}")
+    check("renew-batch shorter ttl visible",
+          3_000 < st["remaining_ms"] <= 5_000, f"{st}")
+
+
 def fetch_events(key, cursor=None, limit=None):
     """翻一页审计事件，返回 (events, next_cursor)。"""
     qs = []
@@ -295,7 +439,7 @@ def fetch_all_events(key, page_size=10):
 
 
 def audit_checks():
-    """审计流：落账字段 / 四类操作 / 分页 / 参数校验 / 批量落账 / 保留裁剪。"""
+    """审计流：落账字段 / 各操作 / 分页 / 参数校验 / 批量落账 / 保留裁剪。"""
     base = f"smoke-audit:{int(time.time() * 1000)}"
     key = f"{base}:single"
 

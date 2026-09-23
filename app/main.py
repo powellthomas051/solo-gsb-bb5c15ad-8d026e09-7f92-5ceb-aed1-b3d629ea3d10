@@ -23,6 +23,7 @@ from .lua import (
     ACQUIRE_LUA,
     LIMIT_CHECK_LUA,
     RELEASE_LUA,
+    RENEW_BATCH_LUA,
     RENEW_LUA,
     VALIDATE_LUA,
 )
@@ -39,6 +40,9 @@ from .schemas import (
     LimitCheckResponse,
     ReleaseRequest,
     ReleaseResponse,
+    RenewBatchRequest,
+    RenewBatchResponse,
+    RenewLeaseResult,
     RenewRequest,
     RenewResponse,
     ValidateRequest,
@@ -56,6 +60,7 @@ async def lifespan(app: FastAPI):
         acquire=redis.register_script(ACQUIRE_LUA),
         acquire_batch=redis.register_script(ACQUIRE_BATCH_LUA),
         renew=redis.register_script(RENEW_LUA),
+        renew_batch=redis.register_script(RENEW_BATCH_LUA),
         release=redis.register_script(RELEASE_LUA),
         validate=redis.register_script(VALIDATE_LUA),
         limit_check=redis.register_script(LIMIT_CHECK_LUA),
@@ -66,7 +71,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lease & Rate Limit API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "供多个工作进程协调独占任务的租约服务，以及基于 Redis Lua 的"
         "原子滑动窗口成本限流（FastAPI + Redis Lua）"
@@ -277,6 +282,71 @@ async def renew(
     return RenewResponse(renewed=False, reason=reason)
 
 
+@app.post(
+    "/v1/leases/renew-batch",
+    response_model=RenewBatchResponse,
+    responses={
+        status.HTTP_409_CONFLICT: {"model": RenewBatchResponse},
+    },
+)
+async def renew_batch(
+    req: RenewBatchRequest,
+    response: Response,
+    scripts: ScriptsDep,
+    settings: SettingsDep,
+) -> RenewBatchResponse:
+    """批量续租（2～32 个不重复任务键，统一 TTL），全成全败。
+
+    由单个 Lua 脚本、单次服务器 TIME 原子完成全量预检：任一租约不存在、
+    凭据（token + fencing_token）不匹配或已过期时，整批返回 409 并逐项
+    给出失败任务及其原因（not_found / conflict / expired），**不修改任何
+    TTL**（预检通过的任务同样保持原样、不落审计事件）。
+    全部有效时一次性把所有租约刷新到同一基准计算的新过期时刻，按输入顺序
+    在 `results` 中返回每项的 `expires_at_ms`，并在各任务键的审计 Stream
+    中逐任务落一条 renewed 事件。
+    """
+    ttl = resolve_ttl(req.ttl_ms, settings)
+    task_keys = [item.task_key for item in req.items]
+    lease_keys = [lease_key(settings, k) for k in task_keys]
+    event_keys = [event_stream_key(settings, k) for k in task_keys]
+
+    result = await scripts.renew_batch(
+        keys=lease_keys + event_keys,
+        args=[
+            str(len(task_keys)),
+            *[item.token for item in req.items],
+            *[str(item.fencing_token) for item in req.items],
+            str(ttl),
+            settings.event_retention,
+        ],
+    )
+
+    if result[0]:
+        results = [
+            RenewLeaseResult(
+                task_key=task_keys[i],
+                renewed=True,
+                expires_at_ms=result[1 + i],
+            )
+            for i in range(len(task_keys))
+        ]
+        return RenewBatchResponse(renewed=True, results=results)
+
+    failed: dict[int, str] = {}
+    for j in range(1, len(result), 2):
+        failed[int(result[j]) - 1] = result[j + 1]
+    results = [
+        RenewLeaseResult(
+            task_key=task_keys[i],
+            renewed=False,
+            reason=reason,
+        )
+        for i, reason in failed.items()
+    ]
+    response.status_code = status.HTTP_409_CONFLICT
+    return RenewBatchResponse(renewed=False, results=results)
+
+
 @app.post("/v1/leases/release", response_model=ReleaseResponse)
 async def release(
     req: ReleaseRequest, scripts: ScriptsDep, settings: SettingsDep
@@ -331,8 +401,8 @@ async def list_events(
 ) -> LeaseEventPage:
     """读取任务键的租约审计事件（Redis Stream），按时间升序游标分页。
 
-    事件在申请（成功 / 被拒）、续租、释放与批量申请逐任务落账时，
-    与租约状态转换在同一个 Lua 脚本内原子写入，包含操作结果、
+    事件在申请（成功 / 被拒）、续租（单个 / 批量）、释放与批量申请逐任务
+    落账时，与租约状态转换在同一个 Lua 脚本内原子写入，包含操作结果、
     防栅序号与 Redis 服务器时间。每个任务键保留最新
     `LEASE_EVENT_RETENTION` 条，超出按最旧事件裁剪。
     """
